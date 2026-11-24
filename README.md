@@ -9,6 +9,9 @@ Departure board + weather forecast on a
 - **Bottom half:** MeteoSwiss local forecast for a Swiss postcode: current
   temperature and icon, today's min/max/rain, and the next 12 hours (icons and
   rain chance per 3 h, hourly temperature line and rain bars).
+- **Tap** the screen to turn it off (backlight off), tap again to turn it back on.
+  It keeps updating in the background. Works with both board versions (V1 has
+  a CST328 touch chip, V2 a CST3530); the serial monitor says which was found.
 
 ## Setup
 

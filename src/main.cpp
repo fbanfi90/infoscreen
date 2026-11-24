@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -40,6 +41,10 @@ static const uint32_t REDRAW_EVERY_MS = 2000;
 #define PIN_LCD_DC   41
 #define PIN_LCD_RST  39
 #define PIN_LCD_BL    5
+// touch controller (CST328, I2C)
+#define PIN_TP_SDA    1
+#define PIN_TP_SCL    3
+#define PIN_TP_RST    2
 
 // ---------- screen layout (portrait 240x320) ----------
 static const int W = 240;
@@ -677,6 +682,150 @@ static void drawStatus() {
   }
 }
 
+// ---------- touch: tap to turn the screen off / on ----------
+// Only "is a finger on the screen" is needed, so this reads just the touch
+// count, not coordinates. The board shipped with two touch chips:
+//  - V1: CST328 at 0x1A (Waveshare demo driver Touch_CST328.cpp)
+//  - V2 (from mid 2026): CST3530 at 0x58 (Waveshare esp_lcd_touch_cst3530)
+// Whichever answers at boot is used.
+enum TouchChip { TOUCH_NONE, TOUCH_CST328, TOUCH_CST3530 };
+static TouchChip touchChip = TOUCH_NONE;
+static bool screenOn = true;
+
+static const uint8_t CST328_ADDR = 0x1A;
+static const uint8_t CST3530_ADDR = 0x58;
+
+// Sends `cmd` (register address or command bytes), then reads `n` bytes.
+static bool i2cQuery(uint8_t addr, const uint8_t *cmd, size_t cmdLen, uint8_t *buf, size_t n) {
+  Wire.beginTransmission(addr);
+  Wire.write(cmd, cmdLen);
+  if (Wire.endTransmission(false) != 0) return false;  // repeated start, no stop
+  if (Wire.requestFrom((uint16_t)addr, n, true) != n) return false;
+  for (size_t i = 0; i < n; i++) buf[i] = Wire.read();
+  return true;
+}
+
+static bool i2cSend(uint8_t addr, const uint8_t *data, size_t n) {
+  Wire.beginTransmission(addr);
+  Wire.write(data, n);
+  return Wire.endTransmission(true) == 0;
+}
+
+// CST3530: 4-byte commands. Info reply has 0xCA 0xCA at bytes 2..3. A touch
+// report has 0xFF at byte 2 (else: no new report), the point count in the low
+// nibble of byte 3 and the key count in the high nibble, then 5 bytes per
+// key/point whose 5th byte's high nibble is the event (0 = finger lifted).
+// Every read is followed by a "clear" command.
+static const uint8_t CST3530_INFO[4]  = {0xD0, 0x03, 0x00, 0x00};
+static const uint8_t CST3530_READ[4]  = {0xD0, 0x07, 0x00, 0x00};
+static const uint8_t CST3530_CLEAR[4] = {0xD0, 0x00, 0x02, 0xAB};
+
+static bool cst3530Detect() {
+  uint8_t buf[4];
+  for (int i = 0; i < 5; i++) {
+    if (i2cQuery(CST3530_ADDR, CST3530_INFO, 4, buf, 4) && buf[2] == 0xCA && buf[3] == 0xCA)
+      return true;
+    delay(10);
+  }
+  return false;
+}
+
+// Fingers pressed per the latest report: >= 0, or -1 if there's no new report.
+static int cst3530Touches() {
+  uint8_t buf[32];
+  bool ok = i2cQuery(CST3530_ADDR, CST3530_READ, 4, buf, sizeof buf);
+  i2cSend(CST3530_ADDR, CST3530_CLEAR, 4);
+  if (!ok || buf[2] != 0xFF) return -1;
+  int points = buf[3] & 0x0F, keys = buf[3] >> 4, pressed = 0;
+  if (points > 5) return -1;
+  for (int i = 0; i < points; i++) {
+    int idx = (keys + i) * 5 + 8;
+    if (idx < (int)sizeof buf && (buf[idx] >> 4) != 0) pressed++;
+  }
+  return pressed;
+}
+
+// CST328: 16-bit registers. Switching to debug-info mode (0xD101) makes the
+// chip info readable at 0xD1F4, where bytes 10..11 read 0xCACA; 0xD109 goes
+// back to normal mode. The touch count is the low nibble of 0xD005, which is
+// written back to 0 after each read.
+static bool cst328Detect() {
+  static const uint8_t infoMode[2] = {0xD1, 0x01}, info[2] = {0xD1, 0xF4},
+                       normalMode[2] = {0xD1, 0x09};
+  uint8_t buf[12] = {0};
+  bool ok = i2cSend(CST328_ADDR, infoMode, 2) && i2cQuery(CST328_ADDR, info, 2, buf, 12);
+  i2cSend(CST328_ADDR, normalMode, 2);
+  return ok && buf[10] == 0xCA && buf[11] == 0xCA;
+}
+
+// Fingers on the screen, or -1 if none (the CST328 has no explicit lift report).
+static int cst328Touches() {
+  static const uint8_t countReg[2] = {0xD0, 0x05}, clear[3] = {0xD0, 0x05, 0x00};
+  uint8_t n = 0;
+  bool ok = i2cQuery(CST328_ADDR, countReg, 2, &n, 1);
+  i2cSend(CST328_ADDR, clear, 3);
+  n &= 0x0F;
+  return (ok && n >= 1 && n <= 5) ? n : -1;
+}
+
+static void touchBegin() {
+  Wire.begin(PIN_TP_SDA, PIN_TP_SCL, 100000);
+  pinMode(PIN_TP_RST, OUTPUT);  // reset is active low
+  digitalWrite(PIN_TP_RST, HIGH);
+  delay(10);
+  digitalWrite(PIN_TP_RST, LOW);
+  delay(10);
+  digitalWrite(PIN_TP_RST, HIGH);
+  delay(120);  // chip boot time
+
+  if (cst3530Detect()) touchChip = TOUCH_CST3530;
+  else if (cst328Detect()) touchChip = TOUCH_CST328;
+  if (touchChip != TOUCH_NONE) {
+    Serial.printf("touch: %s found\n", touchChip == TOUCH_CST3530 ? "CST3530" : "CST328");
+    return;
+  }
+  // Diagnostics: list whatever answers on the touch bus.
+  Serial.print("touch: no known touch chip, tap-to-sleep disabled. I2C devices on SDA=1/SCL=3:");
+  for (uint8_t a = 1; a < 127; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) Serial.printf(" 0x%02X", a);
+  }
+  Serial.println();
+}
+
+// > 0: finger(s) down, 0: finger lifted, -1: nothing new.
+static int touchState() {
+  return touchChip == TOUCH_CST3530 ? cst3530Touches()
+       : touchChip == TOUCH_CST328  ? cst328Touches()
+       : -1;
+}
+
+// The backlight is the screen's light source: off = really dark, and almost
+// all of the display's power. Fetching and drawing go on in the background,
+// so the screen is up to date the moment it comes back.
+static void setScreen(bool on) {
+  screenOn = on;
+  digitalWrite(PIN_LCD_BL, on ? HIGH : LOW);
+  Serial.printf("touch: screen %s\n", on ? "on" : "off");
+}
+
+// Toggles the screen once per tap: on the press, never on the lift. A tap
+// ends with a lift report, or after 300 ms without news (chips that don't
+// report lifts), so a held finger still counts once.
+static void handleTouch() {
+  static bool down = false;
+  static uint32_t lastContact = 0;
+  uint32_t ms = millis();
+  int st = touchState();
+  if (st > 0) {
+    if (!down) setScreen(!screenOn);
+    down = true;
+    lastContact = ms;
+  } else if (st == 0 || (down && ms - lastContact > 300)) {
+    down = false;
+  }
+}
+
 // ---------- main ----------
 void setup() {
   Serial.begin(115200);
@@ -688,6 +837,7 @@ void setup() {
   gfx->fillScreen(C_BG);
   gfx->setTextWrap(false);
   gfx->setTextSize(1);
+  touchBegin();
 
   status("connecting WiFi...", C_GREY);
   WiFi.mode(WIFI_STA);
@@ -706,6 +856,7 @@ void setup() {
 void loop() {
   static uint32_t nextFetch = 0, nextWeather = 0, nextDraw = 0;
   static time_t wxDrawnHour = 0;
+  handleTouch();
   uint32_t ms = millis();
   time_t now = time(nullptr);
 
